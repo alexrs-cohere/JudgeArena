@@ -14,6 +14,13 @@ from typing import TYPE_CHECKING
 
 import pandas as pd
 
+from judgearena.descriptor import (
+    build_run_descriptor,
+    completion_descriptor,
+    descriptor_hash,
+    resolve_dataset_revisions,
+    safe_name,
+)
 from judgearena.eval_utils import _compute_grouped_stats, print_results
 from judgearena.generate import generate_multiturn
 from judgearena.instruction_dataset import load_instructions
@@ -36,7 +43,6 @@ from judgearena.repro import _to_jsonable, write_run_metadata
 from judgearena.utils import (
     cache_function_dataframe,
     compute_pref_summary,
-    generation_cache_token,
     is_thinking_model,
     make_model,
 )
@@ -122,19 +128,23 @@ def _generate_mt_bench_completions(
                 completions=loaded_answers,
                 model_name=model_name,
             )
-        # Fold the resolved generation kwargs into the cache key so changing any
-        # sampling param busts cached completions instead of reusing a stale run.
+        # Content-address the completion cache off the full completion
+        # descriptor so changing any sampling param, truncation, or the resolved
+        # dataset revision busts cached completions instead of reusing a stale run.
         generation_kwargs = _build_mt_bench_generation_kwargs(
             cfg=cfg, model_spec=model_name, role=role
         )
-        sampling_token = generation_cache_token(generation_kwargs)
+        comp_desc = completion_descriptor(
+            cfg, model_name, generation_kwargs=generation_kwargs
+        )
+        cache_name = (
+            f"{cache_prefix}_{safe_name(model_name)}_"
+            f"{cfg.generation.n_instructions}_{descriptor_hash(comp_desc)}"
+        )
         generated_answers = cache_function_dataframe(
             lambda: _run_generation(model_name, generation_kwargs=generation_kwargs),
             ignore_cache=ignore_cache,
-            cache_name=(
-                f"{cache_prefix}_{model_name}_{cfg.generation.n_instructions}_"
-                f"{sampling_token}"
-            ),
+            cache_name=cache_name,
         )
         return _align_mt_bench_completions(
             questions_df=questions_df,
@@ -188,6 +198,7 @@ def _save_mt_bench_results(
     with open(res_folder / f"results-{result_name}.json", "w") as f:
         json.dump(_to_jsonable(results), f, indent=2, allow_nan=False)
 
+    run_descriptor = build_run_descriptor(cfg)
     write_run_metadata(
         output_dir=res_folder,
         entrypoint="judgearena.mt_bench.mt_bench_utils.run_mt_bench",
@@ -197,6 +208,10 @@ def _save_mt_bench_results(
         judge_system_prompt=judge_system_prompt,
         judge_user_prompt_template=judge_user_prompt_template,
         started_at_utc=started_at_utc,
+        run_descriptor=run_descriptor,
+        run_descriptor_sha256=descriptor_hash(run_descriptor, length=None),
+        config_resolved=cfg.model_dump(),
+        dataset_revisions=resolve_dataset_revisions(cfg),
     )
 
 

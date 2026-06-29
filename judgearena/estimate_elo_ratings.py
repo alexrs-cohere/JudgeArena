@@ -1,6 +1,7 @@
 import hashlib
 import json
 import re
+from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -10,6 +11,13 @@ import pandas as pd
 from sklearn.linear_model import LogisticRegression
 
 from judgearena.arenas_utils import _extract_instruction_text, load_arena_dataframe
+from judgearena.descriptor import (
+    build_run_descriptor,
+    completion_descriptor,
+    descriptor_hash,
+    judge_descriptor,
+    resolve_dataset_revisions,
+)
 from judgearena.evaluate import (
     PairScore,
     calibrate_temperature,
@@ -19,7 +27,7 @@ from judgearena.evaluate import (
 )
 from judgearena.generate import generate_instructions
 from judgearena.log import get_logger
-from judgearena.repro import _to_jsonable
+from judgearena.repro import _to_jsonable, write_run_metadata
 from judgearena.utils import (
     build_default_judge_model_kwargs,
     cache_function_dataframe,
@@ -248,6 +256,7 @@ def _prefs_to_battle_results(
 
 def main(cfg: "RunConfig") -> dict:
     assert cfg.elo is not None  # main is dispatched only for elo tasks
+    run_started_at = datetime.now(UTC)
     rng = np.random.default_rng(cfg.run.seed)
 
     # Step 1: Load arena battles
@@ -318,31 +327,31 @@ def main(cfg: "RunConfig") -> dict:
         return s.replace("/", "_")
 
     languages_str = "-".join(sorted(cfg.elo.languages)) if cfg.elo.languages else "all"
-    extra_kwargs_str = (
-        "_".join(f"{k}={v}" for k, v in sorted(extra_kwargs.items()))
-        if extra_kwargs
-        else ""
-    )
     sampling_cache_token = _sampling_cache_token(
         sampling_metadata,
         n_instructions=cfg.generation.n_instructions,
         n_instructions_per_language=cfg.elo.n_instructions_per_language,
     )
-    cache_suffix = (
-        f"{cfg.elo.arena}_{replace_slash(cfg.model.name)}_"
-        f"{sampling_cache_token}_"
-        f"{languages_str}_{cfg.generation.truncate_all_input_chars}_{extra_kwargs['max_tokens']}"
-        + (f"_{extra_kwargs_str}" if extra_kwargs_str else "")
+    # Content-address the completion cache off the resolved completion
+    # descriptor (arena, dataset revision, model, sampling params, truncation,
+    # and the instruction-selection metadata) so any of those changing busts
+    # the cache instead of silently reusing a stale run.
+    completion_desc = completion_descriptor(
+        cfg,
+        cfg.model.name,
+        generation_kwargs=extra_kwargs,
+        selection={
+            "arena": cfg.elo.arena,
+            "languages": languages_str,
+            "n_instructions_per_language": cfg.elo.n_instructions_per_language,
+            "sampling_token": sampling_cache_token,
+        },
     )
-    if len(cache_suffix) > 100:
-        cache_hash = hashlib.sha256(cache_suffix.encode()).hexdigest()[:16]
-        logger.debug(
-            "Cache suffix too long (%d chars), using hash: %s (full: %s)",
-            len(cache_suffix),
-            cache_hash,
-            cache_suffix,
-        )
-        cache_suffix = cache_hash
+    completion_cache_key = descriptor_hash(completion_desc)
+    cache_suffix = (
+        f"{replace_slash(cfg.elo.arena)}_{replace_slash(cfg.model.name)}_"
+        f"{completion_cache_key}"
+    )
     completions_df = cache_function_dataframe(
         lambda: gen_fun(instructions=instructions, model=cfg.model.name),
         ignore_cache=cfg.run.ignore_cache,
@@ -441,11 +450,24 @@ def main(cfg: "RunConfig") -> dict:
             }
         )
 
-    judge_cache_suffix = f"judge_{cache_suffix}"
+    # Content-address the judge cache off the judge descriptor, which folds in
+    # the underlying completion key plus the judge model/sampling/prompt/swap
+    # settings and the seed that drives opponent + position sampling.  This fixes
+    # the previous key that ignored the judge model, sampling params, swap mode,
+    # and prompts entirely.
+    judge_desc = judge_descriptor(
+        cfg,
+        resolved_prompt=resolved_prompt,
+        judge_kwargs=cfg.judge.model_kwargs(
+            fallback_chat_template=cfg.model.chat_template
+        ),
+        completion_keys=[completion_cache_key],
+        extra={"run_seed": cfg.run.seed, "n_battles": n},
+    )
     df_judge = cache_function_dataframe(
         run_judge,
         ignore_cache=cfg.run.ignore_cache,
-        cache_name=f"elo/{judge_cache_suffix}",
+        cache_name=f"elo/judge_{descriptor_hash(judge_desc)}",
     )
 
     # Restore position arrays and prefs from cache (in case loaded from disk)
@@ -710,6 +732,29 @@ def main(cfg: "RunConfig") -> dict:
         summary=result_summary,
         bootstrap_ratings=bootstrap_ratings,
     )
+
+    run_descriptor = build_run_descriptor(cfg)
+    try:
+        write_run_metadata(
+            output_dir=result_path.parent,
+            entrypoint="judgearena.estimate_elo_ratings.main",
+            run=cfg.model_dump(),
+            results=result_summary,
+            input_payloads={
+                "instructions": instructions.tolist(),
+                "completions": our_completions,
+                "opponent_models": opponent_models,
+            },
+            judge_system_prompt=resolved_prompt.system_prompt,
+            judge_user_prompt_template=resolved_prompt.user_prompt_template,
+            started_at_utc=run_started_at,
+            run_descriptor=run_descriptor,
+            run_descriptor_sha256=descriptor_hash(run_descriptor, length=None),
+            config_resolved=cfg.model_dump(),
+            dataset_revisions=resolve_dataset_revisions(cfg),
+        )
+    except OSError as e:
+        logger.warning("Failed to write run metadata: %s", e)
 
     return {
         **result_summary,

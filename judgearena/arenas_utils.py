@@ -23,7 +23,34 @@ def _extract_instruction_text(turn: dict) -> str:
     return " ".join(block["text"] for block in content if block.get("type") == "text")
 
 
-KNOWN_ARENAS = ["LMArena-100k", "LMArena-55k", "LMArena-140k", "ComparIA"]
+# Canonical arena -> HuggingFace dataset repo id, and the single source of truth
+# for the set/order of known arenas. Shared by the loader here and the run
+# descriptor (cache keys / metadata).
+ARENA_HF_REPO_IDS: dict[str, str] = {
+    "LMArena-100k": "lmarena-ai/arena-human-preference-100k",
+    "LMArena-55k": "lmarena-ai/arena-human-preference-55k",
+    "LMArena-140k": "lmarena-ai/arena-human-preference-140k",
+    "ComparIA": "ministere-culture/comparia-votes",
+}
+
+KNOWN_ARENAS = list(ARENA_HF_REPO_IDS)
+
+# The synthetic "LMArena" arena concatenates the LMArena dataset variants.
+LMARENA_COMBINED_ARENAS = [a for a in KNOWN_ARENAS if a.startswith("LMArena")]
+
+
+def arena_repo_ids(arena: str | None) -> list[str]:
+    """Return the HuggingFace dataset repo id(s) an arena reads from.
+
+    ``None`` means all known arenas; ``"LMArena"`` is the concatenation of the
+    LMArena variants.
+    """
+    if arena is None:
+        return [ARENA_HF_REPO_IDS[a] for a in KNOWN_ARENAS]
+    if arena == "LMArena":
+        return [ARENA_HF_REPO_IDS[a] for a in LMARENA_COMBINED_ARENAS]
+    repo_id = ARENA_HF_REPO_IDS.get(arena)
+    return [repo_id] if repo_id else []
 
 
 def _load_arena_dataframe(
@@ -31,7 +58,7 @@ def _load_arena_dataframe(
 ) -> pd.DataFrame:
     assert arena in KNOWN_ARENAS
     if arena == "LMArena-55k":
-        repo_id = "lmarena-ai/arena-human-preference-55k"
+        repo_id = ARENA_HF_REPO_IDS[arena]
         path = snapshot_download(
             repo_id=repo_id,
             repo_type="dataset",
@@ -72,8 +99,7 @@ def _load_arena_dataframe(
         df["benchmark"] = "LMArena-55k"
 
     elif "LMArena" in arena:
-        size = arena.split("-")[1]  # "100k" or "140k"
-        repo_id = f"lmarena-ai/arena-human-preference-{size}"
+        repo_id = ARENA_HF_REPO_IDS[arena]
         path = snapshot_download(
             repo_id=repo_id,
             repo_type="dataset",
@@ -102,7 +128,7 @@ def _load_arena_dataframe(
 
     else:
         path = snapshot_download(
-            repo_id="ministere-culture/comparia-votes",
+            repo_id=ARENA_HF_REPO_IDS["ComparIA"],
             repo_type="dataset",
             allow_patterns="*",
             revision=comparia_revision,
@@ -176,7 +202,7 @@ def _load_arena_dataframe(
     return df
 
 
-_DEFAULT_COMPARIA_REVISION = hf_revision("ministere-culture/comparia-votes")
+_DEFAULT_COMPARIA_REVISION = hf_revision(ARENA_HF_REPO_IDS["ComparIA"])
 
 
 def load_arena_dataframe(
@@ -193,7 +219,7 @@ def load_arena_dataframe(
     if arena is None:
         arenas = KNOWN_ARENAS
     elif arena == "LMArena":
-        arenas = ["LMArena-100k", "LMArena-55k", "LMArena-140k"]
+        arenas = LMARENA_COMBINED_ARENAS
     else:
         return _load_arena_dataframe(arena, comparia_revision)
     return pd.concat(

@@ -12,6 +12,13 @@ from typing import TYPE_CHECKING
 
 import pandas as pd
 
+from judgearena.descriptor import (
+    build_run_descriptor,
+    completion_descriptor,
+    descriptor_hash,
+    resolve_dataset_revisions,
+    safe_name,
+)
 from judgearena.evaluate import judge_and_parse_prefs, resolve_run_judge_prompt
 from judgearena.generate import generate_base, generate_instructions
 from judgearena.instruction_dataset import load_instructions
@@ -38,7 +45,6 @@ from judgearena.utils import (
     compute_pref_summary,
     data_root,
     download_hf,
-    generation_cache_token,
     is_thinking_model,
     make_model,
     read_df,
@@ -363,18 +369,22 @@ def main(cfg: "RunConfig"):
         preloaded = try_load_dataset_completions(cfg.task, model_spec, n_instructions)
         if preloaded is not None:
             return _align_completion_series(preloaded)
-        # Fold the resolved generation kwargs into the cache key so that changing
-        # any sampling param (temperature, seed, top_p/k, max_tokens, ...) busts
-        # the cached completions instead of silently reusing a stale run.
+        # Content-address the completion cache: hashing the full completion
+        # descriptor (task, resolved dataset revision, model spec, resolved
+        # generation kwargs, truncation, instruction count) busts the cache when
+        # any of those change instead of silently reusing a stale run.
         generation_kwargs = _build_generation_kwargs(cfg, model_spec, role=role)
-        sampling_token = generation_cache_token(generation_kwargs)
+        comp_desc = completion_descriptor(
+            cfg, model_spec, generation_kwargs=generation_kwargs
+        )
+        cache_name = (
+            f"{safe_name(cfg.task)}_{safe_name(model_spec)}_"
+            f"{cfg.generation.n_instructions}_{descriptor_hash(comp_desc)}"
+        )
         generated = cache_function_dataframe(
             lambda: _run_generation(model_spec, generation_kwargs=generation_kwargs),
             ignore_cache=ignore_cache,
-            cache_name=(
-                f"{cfg.task}_{model_spec}_{cfg.generation.n_instructions}_"
-                f"{sampling_token}"
-            ),
+            cache_name=cache_name,
         )
         return _align_completion_series(generated)
 
@@ -494,6 +504,7 @@ def main(cfg: "RunConfig"):
     eval_completions_A = completions_A.head(n_instructions).tolist()
     eval_completions_B = completions_B.head(n_instructions).tolist()
 
+    run_descriptor = build_run_descriptor(cfg)
     try:
         write_run_metadata(
             output_dir=res_folder,
@@ -510,6 +521,10 @@ def main(cfg: "RunConfig"):
             judge_system_prompt=resolved_prompt.system_prompt,
             judge_user_prompt_template=resolved_prompt.user_prompt_template,
             started_at_utc=run_started_at,
+            run_descriptor=run_descriptor,
+            run_descriptor_sha256=descriptor_hash(run_descriptor, length=None),
+            config_resolved=cfg.model_dump(),
+            dataset_revisions=resolve_dataset_revisions(cfg),
         )
     except OSError as e:
         logger.warning("Failed to write run metadata: %s", e)

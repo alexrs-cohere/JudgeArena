@@ -17,7 +17,15 @@ from pydantic_settings import (
 )
 
 from judgearena.generate_and_evaluate import native_pairwise_baseline
+from judgearena.log import get_logger
+from judgearena.repro import (
+    _get_git_hash,
+    load_run_metadata,
+    resolved_config_from_metadata,
+)
 from judgearena.tasks import ELO_TASK_PREFIX, ELO_TASK_TO_ARENA
+
+logger = get_logger(__name__)
 
 # Set by build_run_config() for the duration of RunConfig() construction.
 _ACTIVE_CONFIG_PATH: str | None = None
@@ -437,17 +445,89 @@ class RunConfig(BaseSettings):
         return tuple(sources) or (init_settings,)
 
 
+def _warn_on_rerun_mismatch(metadata: dict) -> None:
+    """Warn when the current environment diverges from the recorded run."""
+    recorded_git = metadata.get("git_hash")
+    current_git = _get_git_hash(start_path=Path(__file__).resolve().parent)
+    if recorded_git and current_git and recorded_git != current_git:
+        logger.warning(
+            "--rerun: code git hash differs from the recorded run "
+            "(recorded %s, current %s); results may not match.",
+            recorded_git,
+            current_git,
+        )
+
+    recorded_revisions = metadata.get("dataset_revisions")
+    if isinstance(recorded_revisions, dict):
+        from judgearena.descriptor import resolve_dataset_revisions
+
+        try:
+            current_cfg = RunConfig(**resolved_config_from_metadata(metadata))
+            current_revisions = resolve_dataset_revisions(current_cfg)
+        except Exception:
+            current_revisions = None
+        if current_revisions is not None and current_revisions != recorded_revisions:
+            logger.warning(
+                "--rerun: dataset revisions differ from the recorded run "
+                "(recorded %s, current %s).",
+                recorded_revisions,
+                current_revisions,
+            )
+
+
+def build_config_from_rerun(
+    rerun_path: str | Path,
+    *,
+    cli_args: list[str] | None = None,
+    quiet: bool = False,
+    verbose: int = 0,
+) -> RunConfig:
+    """Rebuild a RunConfig from a run-metadata file written by a previous run.
+
+    The recorded ``config_resolved`` is the single source of truth; only
+    operational, non-result-affecting overrides (``--run.result_folder`` and
+    ``-v`` / ``-q``) are honoured so a rerun reuses the content-addressed caches.
+    """
+    metadata = load_run_metadata(rerun_path)
+    config_resolved = resolved_config_from_metadata(metadata)
+    _warn_on_rerun_mismatch(metadata)
+
+    cfg = RunConfig(**config_resolved)
+
+    override = argparse.ArgumentParser(add_help=False)
+    override.add_argument("--run.result_folder", dest="result_folder", default=None)
+    override.add_argument("--result_folder", dest="result_folder_alias", default=None)
+    ov, _ = override.parse_known_args(cli_args or [])
+    new_folder = ov.result_folder or ov.result_folder_alias
+    if new_folder is not None:
+        cfg.run.result_folder = new_folder
+
+    cfg.run.verbosity = -1 if quiet else verbose
+    return cfg
+
+
 def build_run_config(argv: list[str] | None = None) -> RunConfig:
     """Build a RunConfig from CLI flags and an optional --config_path YAML.
 
-    Precedence: CLI flags > --config_path YAML > model defaults.
+    Precedence: CLI flags > --config_path YAML > model defaults. When
+    ``--rerun PATH`` is given, the config is rebuilt from that run's metadata
+    instead (see :func:`build_config_from_rerun`).
     """
     global _ACTIVE_CONFIG_PATH, _ACTIVE_CLI_ARGS
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--config_path", default=None)
+    pre.add_argument("--rerun", default=None)
     pre.add_argument("-v", "--verbose", action="count", default=0)
     pre.add_argument("-q", "--quiet", action="store_true")
     pre_args, rest = pre.parse_known_args(argv)
+
+    if pre_args.rerun is not None:
+        return build_config_from_rerun(
+            pre_args.rerun,
+            cli_args=rest,
+            quiet=pre_args.quiet,
+            verbose=pre_args.verbose,
+        )
 
     _ACTIVE_CONFIG_PATH = pre_args.config_path
     _ACTIVE_CLI_ARGS = rest

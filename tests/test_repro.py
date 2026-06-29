@@ -76,6 +76,44 @@ def test_write_run_metadata_hashes_instruction_indices_as_set(tmp_path, monkeypa
     )
 
 
+def test_write_run_metadata_v2_records_descriptor_and_artifact_hashes(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(repro, "_get_dependency_versions", lambda *a, **k: {})
+    monkeypatch.setattr(repro, "_get_git_hash", lambda *a, **k: "b" * 40)
+
+    (tmp_path / "annotations.csv").write_text("instruction_index\n0\n")
+
+    metadata_path = repro.write_run_metadata(
+        output_dir=tmp_path,
+        entrypoint="judgearena.test.entrypoint",
+        run={"task": "alpaca-eval"},
+        run_descriptor={"task": "alpaca-eval", "run_seed": 0},
+        run_descriptor_sha256="deadbeef",
+        config_resolved={"task": "alpaca-eval"},
+        dataset_revisions={"repo": "rev-1"},
+    )
+
+    metadata = json.loads(metadata_path.read_text())
+    assert metadata["schema_version"] == "judgearena-run-metadata/v2"
+    assert metadata["run_descriptor"] == {"task": "alpaca-eval", "run_seed": 0}
+    assert metadata["run_descriptor_sha256"] == "deadbeef"
+    assert metadata["config_resolved"] == {"task": "alpaca-eval"}
+    assert metadata["dataset_revisions"] == {"repo": "rev-1"}
+    artifact = next(a for a in metadata["artifacts"] if a["path"] == "annotations.csv")
+    assert len(artifact["sha256"]) == 64
+
+
+def test_resolved_config_from_metadata_requires_v2():
+    import pytest
+
+    with pytest.raises(ValueError):
+        repro.resolved_config_from_metadata({"schema_version": "v1"})
+    assert repro.resolved_config_from_metadata(
+        {"config_resolved": {"task": "alpaca-eval"}}
+    ) == {"task": "alpaca-eval"}
+
+
 def test_write_run_metadata_omits_optional_fields_when_inputs_missing(
     tmp_path, monkeypatch
 ):

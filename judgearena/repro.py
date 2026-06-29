@@ -19,8 +19,11 @@ from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any
 
-METADATA_FILENAME = "run-metadata.v1.json"
-METADATA_SCHEMA_VERSION = "judgearena-run-metadata/v1"
+# v1 kept for readers of older runs; new runs are written as v2.
+METADATA_FILENAME_V1 = "run-metadata.v1.json"
+METADATA_SCHEMA_VERSION_V1 = "judgearena-run-metadata/v1"
+METADATA_FILENAME = "run-metadata.v2.json"
+METADATA_SCHEMA_VERSION = "judgearena-run-metadata/v2"
 _REQUIREMENT_NAME_RE = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9_.-]*)")
 
 
@@ -175,6 +178,17 @@ def _get_git_hash(start_path: Path) -> str | None:
     return _run_git(["rev-parse", "HEAD"], cwd=root)
 
 
+def _hash_file_sha256(path: Path) -> str | None:
+    try:
+        digest = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
 def _collect_artifacts(
     output_dir: Path, metadata_filename: str
 ) -> list[dict[str, Any]]:
@@ -189,6 +203,7 @@ def _collect_artifacts(
             {
                 "path": str(rel),
                 "size_bytes": path.stat().st_size,
+                "sha256": _hash_file_sha256(path),
             }
         )
     return artifacts
@@ -231,9 +246,20 @@ def write_run_metadata(
     judge_system_prompt: str | None = None,
     judge_user_prompt_template: str | None = None,
     started_at_utc: datetime | None = None,
+    run_descriptor: dict[str, Any] | None = None,
+    run_descriptor_sha256: str | None = None,
+    config_resolved: dict[str, Any] | None = None,
+    dataset_revisions: dict[str, Any] | None = None,
     metadata_filename: str = METADATA_FILENAME,
 ) -> Path:
-    """Write run metadata JSON and return the output path."""
+    """Write run metadata JSON and return the output path.
+
+    ``run_descriptor`` / ``run_descriptor_sha256`` record the canonical
+    result-affecting descriptor (see :mod:`judgearena.descriptor`).
+    ``config_resolved`` is the fully-resolved ``RunConfig.model_dump()`` so a run
+    can be replayed verbatim via ``--rerun``.  ``dataset_revisions`` records the
+    resolved dataset pins the run read.
+    """
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -266,6 +292,15 @@ def write_run_metadata(
     if git_hash:
         metadata["git_hash"] = git_hash
 
+    if run_descriptor is not None:
+        metadata["run_descriptor"] = _to_jsonable(run_descriptor)
+    if run_descriptor_sha256 is not None:
+        metadata["run_descriptor_sha256"] = run_descriptor_sha256
+    if config_resolved is not None:
+        metadata["config_resolved"] = _to_jsonable(config_resolved)
+    if dataset_revisions is not None:
+        metadata["dataset_revisions"] = _to_jsonable(dataset_revisions)
+
     instruction_indices = None
     if input_payloads and "instruction_index" in input_payloads:
         raw_indices = _to_jsonable(input_payloads["instruction_index"])
@@ -291,3 +326,27 @@ def write_run_metadata(
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(_to_jsonable(metadata), f, indent=2, allow_nan=False)
     return metadata_path
+
+
+def load_run_metadata(path: str | Path) -> dict[str, Any]:
+    """Load a run-metadata JSON file written by :func:`write_run_metadata`."""
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"Run metadata file {path} must contain a JSON object.")
+    return data
+
+
+def resolved_config_from_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Extract the round-trippable resolved config recorded in run metadata.
+
+    Raises a clear error for older (v1) metadata that predates
+    ``config_resolved`` and therefore cannot be replayed via ``--rerun``.
+    """
+    config_resolved = metadata.get("config_resolved")
+    if not isinstance(config_resolved, dict):
+        raise ValueError(
+            "Run metadata does not contain a 'config_resolved' block; "
+            "--rerun requires a v2 metadata file produced by a recent run."
+        )
+    return config_resolved
